@@ -1,0 +1,101 @@
+syntax = "proto3";
+package hypermarket.clob;
+
+message NewOrder {
+  string request_id = 1;
+  uint64 market_id = 2;
+  uint64 subaccount_id = 3;
+  string side = 4; // BUY/SELL
+  string order_type = 5; // LIMIT/MARKET/IOC/FOK/POST_ONLY
+  string tif = 6; // GTC/IOC/FOK
+  uint64 price_ticks = 7;
+  uint64 qty = 8;
+  bool reduce_only = 9;
+  uint64 expiry_ts = 10;
+  uint64 nonce = 11;
+  bytes signature = 12;
+  uint64 client_ts = 13;
+}
+
+message CancelOrder {
+  string request_id = 1;
+  uint64 market_id = 2;
+  uint64 subaccount_id = 3;
+  uint64 order_id = 4;
+  uint64 nonce_start = 5;
+  uint64 nonce_end = 6;
+}
+
+message PriceUpdate {
+  uint64 market_id = 1;
+  uint64 mark_price = 2;
+  uint64 index_price = 3;
+  uint64 ts = 4;
+}
+
+message FundingUpdate {
+  uint64 market_id = 1;
+  int64 funding_index = 2;
+  uint64 ts = 3;
+}
+
+message OrderAck {
+  string request_id = 1;
+  string status = 2; // ACCEPTED/REJECTED
+  string reject_reason = 3;
+  uint64 assigned_order_id = 4;
+  uint64 engine_seq = 5;
+  uint64 ts = 6;
+}
+
+message Fill {
+  uint64 market_id = 1;
+  uint64 maker_order_id = 2;
+  uint64 taker_order_id = 3;
+  uint64 price_ticks = 4;
+  uint64 qty = 5;
+  int64 maker_fee = 6;
+  int64 taker_fee = 7;
+  uint64 engine_seq = 8;
+  uint64 ts = 9;
+}
+
+message BookLevel {
+  uint64 price_ticks = 1;
+  uint64 qty = 2;
+}
+
+message BookDelta {
+  uint64 market_id = 1;
+  repeated BookLevel bids_levels = 2;
+  repeated BookLevel asks_levels = 3;
+  uint64 engine_seq = 4;
+  uint64 ts = 5;
+}
+
+message SettlementBatch {
+  string batch_id = 1;
+  uint64 ts = 2;
+  repeated Fill fills = 3;
+  string price_refs = 4;
+  string funding_refs = 5;
+  bytes state_root = 6;
+}
+
+message InputEvent {
+  oneof payload {
+    NewOrder new_order = 1;
+    CancelOrder cancel_order = 2;
+    PriceUpdate price_update = 3;
+    FundingUpdate funding_update = 4;
+  }
+}
+
+message OutputEvent {
+  oneof payload {
+    OrderAck order_ack = 1;
+    Fill fill = 2;
+    BookDelta book_delta = 3;
+    SettlementBatch settlement_batch = 4;
+  }
+}
