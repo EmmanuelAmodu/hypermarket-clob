@@ -33,7 +33,7 @@ pub struct MarketConfig {
     pub batch_interval_ms: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchingMode {
     Batch,

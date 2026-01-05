@@ -31,7 +31,7 @@ pub struct OrderView {
     pub ingress_seq: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct OrderNode {
     order_id: OrderId,
     subaccount_id: u64,
@@ -100,7 +100,27 @@ impl OrderBook {
         };
         let order = self.orders.get(idx).cloned();
         if let Some(order) = order {
-            self.detach_from_level(idx, &order);
+            let mut remove_level = false;
+            {
+                let level_opt = match order.side {
+                    Side::Buy => self.bids.get_mut(&order.price_ticks),
+                    Side::Sell => self.asks.get_mut(&order.price_ticks),
+                };
+                if let Some(level) = level_opt {
+                    Self::detach_from_level(idx, &order, &mut self.orders, level);
+                    remove_level = level.total_qty == 0;
+                }
+            }
+            if remove_level {
+                match order.side {
+                    Side::Buy => {
+                        self.bids.remove(&order.price_ticks);
+                    }
+                    Side::Sell => {
+                        self.asks.remove(&order.price_ticks);
+                    }
+                }
+            }
             self.orders.remove(idx);
             self.order_index.remove(&order_id);
             return true;
@@ -127,58 +147,72 @@ impl OrderBook {
             if matches >= max_matches {
                 break;
             }
-            let (best_price, best_level) = match incoming.side {
-                Side::Buy => self.asks.iter_mut().next().map(|(p, l)| (*p, l)),
-                Side::Sell => self.bids.iter_mut().rev().next().map(|(p, l)| (*p, l)),
+            let best_price = match incoming.side {
+                Side::Buy => match self.asks.keys().next().copied() {
+                    Some(p) => p,
+                    None => break,
+                },
+                Side::Sell => match self.bids.keys().next_back().copied() {
+                    Some(p) => p,
+                    None => break,
+                },
             };
-            let (best_price, level) = match (best_price, best_level) {
-                (Some(p), Some(l)) => (p, l),
-                _ => break,
-            };
-            if !self.crosses(incoming.side, incoming.order_type, incoming.price_ticks, best_price) {
+            if !Self::crosses(incoming.side, incoming.order_type, incoming.price_ticks, best_price) {
                 break;
             }
-            let head_idx = match level.head {
-                Some(idx) => idx,
-                None => {
-                    self.remove_level_if_empty(incoming.side, best_price);
-                    continue;
-                }
-            };
-            let Some(mut maker) = self.orders.get(head_idx).cloned() else {\n+                break;\n+            };
-            let trade_qty = remaining.min(maker.remaining);
-            remaining -= trade_qty;
-            maker.remaining -= trade_qty;
-            level.total_qty -= trade_qty;
-            matches += 1;
+            let mut remove_level = false;
+            {
+                let level_opt = match incoming.side {
+                    Side::Buy => self.asks.get_mut(&best_price),
+                    Side::Sell => self.bids.get_mut(&best_price),
+                };
+                let Some(level) = level_opt else { break };
+                if let Some(head_idx) = level.head {
+                    if let Some(mut maker) = self.orders.get(head_idx).cloned() {
+                        let trade_qty = remaining.min(maker.remaining);
+                        remaining -= trade_qty;
+                        maker.remaining -= trade_qty;
+                        level.total_qty = level.total_qty.saturating_sub(trade_qty);
+                        matches += 1;
 
-            fills.push(Fill {
-                market_id: 0,
-                maker_order_id: maker.order_id,
-                taker_order_id: incoming.order_id,
-                price_ticks: best_price,
-                qty: trade_qty,
-                maker_fee: 0,
-                taker_fee: 0,
-                engine_seq: 0,
-                ts: 0,
-            });
+                        fills.push(Fill {
+                            market_id: 0,
+                            maker_order_id: maker.order_id,
+                            taker_order_id: incoming.order_id,
+                            price_ticks: best_price,
+                            qty: trade_qty,
+                            maker_fee: 0,
+                            taker_fee: 0,
+                            engine_seq: 0,
+                            ts: 0,
+                        });
 
-            if maker.remaining == 0 {
-                let next = maker.next;
-                self.detach_from_level(head_idx, &maker);
-                self.orders.remove(head_idx);
-                self.order_index.remove(&maker.order_id);
-                level.head = next;
-                if level.head.is_none() {
-                    level.tail = None;
+                        if maker.remaining == 0 {
+                            Self::detach_from_level(head_idx, &maker, &mut self.orders, level);
+                            self.orders.remove(head_idx);
+                            self.order_index.remove(&maker.order_id);
+                        } else {
+                            self.orders[head_idx] = maker;
+                        }
+
+                        remove_level = level.total_qty == 0;
+                    } else {
+                        remove_level = true;
+                    }
+                } else {
+                    remove_level = true;
                 }
-            } else {
-                self.orders[head_idx] = maker;
             }
 
-            if level.total_qty == 0 {
-                self.remove_level_if_empty(incoming.side, best_price);
+            if remove_level {
+                match incoming.side {
+                    Side::Buy => {
+                        self.asks.remove(&best_price);
+                    }
+                    Side::Sell => {
+                        self.bids.remove(&best_price);
+                    }
+                }
             }
         }
 
@@ -234,48 +268,23 @@ impl OrderBook {
         incoming.order_id
     }
 
-    fn detach_from_level(&mut self, idx: usize, order: &OrderNode) {
-        let level = match order.side {
-            Side::Buy => self.bids.get_mut(&order.price_ticks),
-            Side::Sell => self.asks.get_mut(&order.price_ticks),
-        };
-        if let Some(level) = level {
-            if level.head == Some(idx) {
-                level.head = order.next;
-            }
-            if level.tail == Some(idx) {
-                level.tail = order.prev;
-            }
-            if let Some(prev) = order.prev {
-                self.orders[prev].next = order.next;
-            }
-            if let Some(next) = order.next {
-                self.orders[next].prev = order.prev;
-            }
-            level.total_qty = level.total_qty.saturating_sub(order.remaining);
+    fn detach_from_level(idx: usize, order: &OrderNode, orders: &mut slab::Slab<OrderNode>, level: &mut Level) {
+        if level.head == Some(idx) {
+            level.head = order.next;
         }
+        if level.tail == Some(idx) {
+            level.tail = order.prev;
+        }
+        if let Some(prev) = order.prev {
+            orders[prev].next = order.next;
+        }
+        if let Some(next) = order.next {
+            orders[next].prev = order.prev;
+        }
+        level.total_qty = level.total_qty.saturating_sub(order.remaining);
     }
 
-    fn remove_level_if_empty(&mut self, side: Side, price: PriceTicks) {
-        match side {
-            Side::Buy => {
-                if let Some(level) = self.bids.get(&price) {
-                    if level.total_qty == 0 {
-                        self.bids.remove(&price);
-                    }
-                }
-            }
-            Side::Sell => {
-                if let Some(level) = self.asks.get(&price) {
-                    if level.total_qty == 0 {
-                        self.asks.remove(&price);
-                    }
-                }
-            }
-        }
-    }
-
-    fn crosses(&self, side: Side, order_type: OrderType, limit_price: PriceTicks, best_price: PriceTicks) -> bool {
+    fn crosses(side: Side, order_type: OrderType, limit_price: PriceTicks, best_price: PriceTicks) -> bool {
         match order_type {
             OrderType::Market => true,
             _ => match side {
@@ -290,7 +299,7 @@ impl OrderBook {
         match incoming.side {
             Side::Buy => {
                 for (price, level) in &self.asks {
-                    if !self.crosses(incoming.side, incoming.order_type, incoming.price_ticks, *price) {
+                    if !Self::crosses(incoming.side, incoming.order_type, incoming.price_ticks, *price) {
                         break;
                     }
                     available = available.saturating_add(level.total_qty);
@@ -298,7 +307,7 @@ impl OrderBook {
             }
             Side::Sell => {
                 for (price, level) in self.bids.iter().rev() {
-                    if !self.crosses(incoming.side, incoming.order_type, incoming.price_ticks, *price) {
+                    if !Self::crosses(incoming.side, incoming.order_type, incoming.price_ticks, *price) {
                         break;
                     }
                     available = available.saturating_add(level.total_qty);

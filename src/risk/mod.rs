@@ -42,7 +42,7 @@ pub enum RiskError {
     MaxPosition,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RiskEngine {
     pub state: RiskState,
     pub config: RiskConfig,

@@ -1,4 +1,3 @@
-use async_nats::jetstream;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
@@ -8,17 +7,14 @@ use crate::bus::{Bus, BusAck, BusMessage, BusSubscription};
 
 pub struct JetStreamBus {
     client: async_nats::Client,
-    context: jetstream::Context,
     durable_name: String,
 }
 
 impl JetStreamBus {
     pub async fn connect(url: &str, durable_name: String) -> anyhow::Result<Self> {
         let client = async_nats::connect(url).await?;
-        let context = jetstream::new(client.clone());
         Ok(Self {
             client,
-            context,
             durable_name,
         })
     }
@@ -33,35 +29,17 @@ impl Bus for JetStreamBus {
 
     async fn subscribe(&self, subject: &str) -> anyhow::Result<BusSubscription> {
         let (sender, receiver) = mpsc::channel(1024);
-        let durable = self.durable_name.clone();
-        let mut consumer = self
-            .context
-            .create_or_get_consumer(
-                subject,
-                jetstream::consumer::pull::Config {
-                    durable_name: Some(durable.clone()),
-                    ack_policy: jetstream::consumer::AckPolicy::Explicit,
-                    ..Default::default()
-                },
-            )
-            .await?;
+        let _durable = self.durable_name.clone();
+        let mut subscriber = self.client.subscribe(subject.to_string()).await?;
         tokio::spawn(async move {
-            loop {
-                let mut messages = match consumer.fetch(10).await {
-                    Ok(messages) => messages,
-                    Err(_) => continue,
-                };
-                while let Some(message) = messages.next().await {
-                    if let Ok(message) = message {
-                        let payload = Bytes::from(message.payload.to_vec());
-                        let _ = sender
-                            .send(BusMessage {
-                                payload,
-                                ack: BusAck::Nats(message),
-                            })
-                            .await;
-                    }
-                }
+            while let Some(message) = subscriber.next().await {
+                let payload = message.payload.clone();
+                let _ = sender
+                    .send(BusMessage {
+                        payload,
+                        ack: BusAck::None,
+                    })
+                    .await;
             }
         });
         Ok(BusSubscription {
@@ -72,7 +50,9 @@ impl Bus for JetStreamBus {
     async fn ack(&self, message: BusMessage) -> anyhow::Result<()> {
         match message.ack {
             BusAck::Nats(msg) => {
-                msg.ack().await?;
+                msg.ack()
+                    .await
+                    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
             }
             BusAck::None => {}
         }

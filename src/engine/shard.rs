@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
-use tracing::{info, instrument};
+use tracing::instrument;
 
 use crate::config::{MarketConfig, MatchingMode};
 use crate::matching::batch::BatchAuction;
@@ -105,7 +105,7 @@ impl EngineShard {
         }
     }
 
-    pub fn restore(state: EngineState, markets: Vec<MarketConfig>, wal: Wal, mut risk: RiskEngine) -> Self {
+    pub fn restore(state: EngineState, markets: Vec<MarketConfig>, wal: Wal, risk: RiskEngine) -> Self {
         let mut shard = EngineShard::new(state.shard_id, markets, wal, risk.clone());
         shard.engine_seq = state.engine_seq;
         shard.next_order_id = state.next_order_id;
@@ -166,10 +166,10 @@ impl EngineShard {
             return Vec::new();
         }
         self.dedupe.put(order.request_id.clone(), ());
-        let Some(market) = self.markets.get_mut(&order.market_id) else {
+        let Some(market_state) = self.markets.get(&order.market_id) else {
             return vec![self.reject(order.request_id, "unknown market", ts)];
         };
-        if let Err(reason) = self.validate_order(&order, market) {
+        if let Err(reason) = self.validate_order(&order, market_state) {
             return vec![self.reject(order.request_id, reason, ts)];
         }
 
@@ -203,28 +203,63 @@ impl EngineShard {
             ts,
         });
 
-        match market.config.matching_mode {
+        let (matching_mode, market_config, fills, snapshot, closed_ids) = {
+            let market = self
+                .markets
+                .get_mut(&order.market_id)
+                .expect("market exists");
+            let mode = market.config.matching_mode;
+            let config = market.config.clone();
+            match mode {
+                MatchingMode::Continuous => {
+                    let (fills, _) = market.book.place_order(incoming, 1024);
+                    let snapshot = market.book.snapshot(10);
+                    let mut closed_ids = Vec::new();
+                    for fill in &fills {
+                        if !market.book.has_order(fill.maker_order_id) {
+                            closed_ids.push(fill.maker_order_id);
+                        }
+                        if !market.book.has_order(fill.taker_order_id) {
+                            closed_ids.push(fill.taker_order_id);
+                        }
+                    }
+                    (mode, config, fills, Some(snapshot), closed_ids)
+                }
+                MatchingMode::Batch => {
+                    market.batch.push(incoming);
+                    (mode, config, Vec::new(), None, Vec::new())
+                }
+            }
+        };
+
+        match matching_mode {
             MatchingMode::Continuous => {
-                let (fills, _) = market.book.place_order(incoming, 1024);
-                events.extend(self.emit_fills(fills, &market.config, market, ts));
-                events.push(self.emit_book_delta(order.market_id, market, ts));
+                events.extend(self.emit_fills(fills, &market_config, ts));
+                for order_id in closed_ids {
+                    self.order_owners.remove(&order_id);
+                }
+                if let Some(snapshot) = snapshot {
+                    events.push(self.book_delta_from_snapshot(order.market_id, snapshot, ts));
+                }
             }
-            MatchingMode::Batch => {
-                market.batch.push(incoming);
-            }
+            MatchingMode::Batch => {}
         }
 
         events
     }
 
     fn on_cancel(&mut self, cancel: CancelOrder, ts: u64) -> Vec<EventEnvelope> {
-        if let Some(market) = self.markets.get_mut(&cancel.market_id) {
-            if let Some(order_id) = cancel.order_id {
+        let mut snapshot = None;
+        if let Some(order_id) = cancel.order_id {
+            if let Some(market) = self.markets.get_mut(&cancel.market_id) {
                 if market.book.cancel(order_id) {
                     self.order_owners.remove(&order_id);
-                    return vec![self.emit_book_delta(cancel.market_id, market, ts)];
+                    snapshot = Some(market.book.snapshot(10));
                 }
             }
+        }
+        if let Some(snapshot) = snapshot {
+            return vec![self.book_delta_from_snapshot(cancel.market_id, snapshot, ts)];
         }
         Vec::new()
     }
@@ -267,7 +302,7 @@ impl EngineShard {
         }
     }
 
-    fn emit_fills(&mut self, fills: Vec<Fill>, market: &MarketConfig, market_state: &MarketState, ts: u64) -> Vec<EventEnvelope> {
+    fn emit_fills(&mut self, fills: Vec<Fill>, market: &MarketConfig, ts: u64) -> Vec<EventEnvelope> {
         fills
             .into_iter()
             .map(|mut fill| {
@@ -284,12 +319,6 @@ impl EngineShard {
                 if let Some((taker_sub, taker_side)) = self.order_owners.get(&fill.taker_order_id).copied() {
                     self.risk.apply_fill(market, taker_sub, taker_side, fill.price_ticks, fill.qty, taker_fee);
                 }
-                if !market_state.book.has_order(fill.maker_order_id) {
-                    self.order_owners.remove(&fill.maker_order_id);
-                }
-                if !market_state.book.has_order(fill.taker_order_id) {
-                    self.order_owners.remove(&fill.taker_order_id);
-                }
                 EventEnvelope {
                     shard_id: self.shard_id,
                     engine_seq: self.engine_seq,
@@ -300,8 +329,7 @@ impl EngineShard {
             .collect()
     }
 
-    fn emit_book_delta(&self, market_id: MarketId, market: &MarketState, ts: u64) -> EventEnvelope {
-        let snapshot = market.book.snapshot(10);
+    fn book_delta_from_snapshot(&self, market_id: MarketId, snapshot: crate::matching::orderbook::BookSnapshot, ts: u64) -> EventEnvelope {
         let bids_levels = snapshot
             .bids
             .into_iter()
