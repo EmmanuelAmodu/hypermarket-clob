@@ -4,11 +4,17 @@ use bytes::Bytes;
 pub trait Bus: Send + Sync {
     async fn publish(&self, subject: &str, payload: Bytes) -> anyhow::Result<()>;
     async fn subscribe(&self, subject: &str) -> anyhow::Result<BusSubscription>;
-    async fn ack(&self, _message: BusMessage) -> anyhow::Result<()>;
+    async fn ack(&self, message: BusMessage) -> anyhow::Result<()>;
 }
 
 pub struct BusMessage {
     pub payload: Bytes,
+    pub ack: BusAck,
+}
+
+pub enum BusAck {
+    Nats(async_nats::jetstream::Message),
+    None,
 }
 
 pub struct BusSubscription {

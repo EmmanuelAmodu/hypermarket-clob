@@ -3,11 +3,11 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::bus::{Bus, BusMessage, BusSubscription};
+use crate::bus::{Bus, BusAck, BusMessage, BusSubscription};
 
 pub struct JetStreamBus {
     client: async_nats::Client,
-    _durable_name: String,
+    durable_name: String,
 }
 
 impl JetStreamBus {
@@ -15,7 +15,7 @@ impl JetStreamBus {
         let client = async_nats::connect(url).await?;
         Ok(Self {
             client,
-            _durable_name: durable_name,
+            durable_name,
         })
     }
 }
@@ -29,11 +29,17 @@ impl Bus for JetStreamBus {
 
     async fn subscribe(&self, subject: &str) -> anyhow::Result<BusSubscription> {
         let (sender, receiver) = mpsc::channel(1024);
+        let _durable = self.durable_name.clone();
         let mut subscriber = self.client.subscribe(subject.to_string()).await?;
         tokio::spawn(async move {
             while let Some(message) = subscriber.next().await {
-                let payload = Bytes::from(message.payload.to_vec());
-                let _ = sender.send(BusMessage { payload }).await;
+                let payload = message.payload.clone();
+                let _ = sender
+                    .send(BusMessage {
+                        payload,
+                        ack: BusAck::None,
+                    })
+                    .await;
             }
         });
         Ok(BusSubscription {
@@ -42,7 +48,14 @@ impl Bus for JetStreamBus {
     }
 
     async fn ack(&self, message: BusMessage) -> anyhow::Result<()> {
-        let _ = message;
+        match message.ack {
+            BusAck::Nats(msg) => {
+                msg.ack()
+                    .await
+                    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+            }
+            BusAck::None => {}
+        }
         Ok(())
     }
 }

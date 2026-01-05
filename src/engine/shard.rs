@@ -105,7 +105,7 @@ impl EngineShard {
         }
     }
 
-    pub fn restore(state: EngineState, markets: Vec<MarketConfig>, wal: Wal, mut risk: RiskEngine) -> Self {
+    pub fn restore(state: EngineState, markets: Vec<MarketConfig>, wal: Wal, risk: RiskEngine) -> Self {
         let mut shard = EngineShard::new(state.shard_id, markets, wal, risk.clone());
         shard.engine_seq = state.engine_seq;
         shard.next_order_id = state.next_order_id;
@@ -232,14 +232,17 @@ impl EngineShard {
             }
         };
 
-        if matching_mode == MatchingMode::Continuous {
-            events.extend(self.emit_fills(fills, &market_config, ts));
-            for order_id in closed_ids {
-                self.order_owners.remove(&order_id);
+        match matching_mode {
+            MatchingMode::Continuous => {
+                events.extend(self.emit_fills(fills, &market_config, ts));
+                for order_id in closed_ids {
+                    self.order_owners.remove(&order_id);
+                }
+                if let Some(snapshot) = snapshot {
+                    events.push(self.book_delta_from_snapshot(order.market_id, snapshot, ts));
+                }
             }
-            if let Some(snapshot) = snapshot {
-                events.push(self.book_delta_from_snapshot(order.market_id, snapshot, ts));
-            }
+            MatchingMode::Batch => {}
         }
 
         events
