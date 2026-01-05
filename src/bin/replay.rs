@@ -32,7 +32,7 @@ fn main() -> anyhow::Result<()> {
         .transpose()?
         .flatten();
 
-    let replay_path = std::env::temp_dir().join(\"replay.wal\");
+    let replay_path = std::env::temp_dir().join("replay.wal");
     let wal = Wal::open(&replay_path)?;
     let risk = RiskEngine::new(RiskConfig {
         max_slippage_bps: 50,
