@@ -93,6 +93,13 @@ cargo bench
 See `config/example.yaml` for available options:
 - NATS URLs and subjects
 - shard_count
-- market configuration
+- market configuration (optional seed list; supports dynamic markets via NATS KV)
 - WAL + snapshot paths
 - snapshot interval and book delta depth
+
+### Dynamic markets (recommended)
+
+Markets can be created/updated at runtime by writing JSON `MarketConfig` objects into a NATS JetStream KV bucket:
+- Bucket: `bus.markets_bucket` (default `MARKETS`)
+- Key: `<market_id>`
+- Value: JSON-encoded `MarketConfig` (same fields as in `config/example.yaml`)

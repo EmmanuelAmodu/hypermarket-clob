@@ -197,6 +197,7 @@ mod tests {
             maintenance_margin_bps: 250,
             max_position: 100,
             price_band_bps: 1000,
+            max_open_orders_per_subaccount: 0,
             matching_mode: crate::config::MatchingMode::Continuous,
             batch_interval_ms: 2000,
         };

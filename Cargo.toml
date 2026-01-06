@@ -9,6 +9,7 @@ async-trait = "0.1"
 async-nats = "0.38"
 blake3 = "1"
 bytes = "1"
+futures = "0.3"
 lru = "0.12"
 bincode = "1"
 clap = { version = "4", features = ["derive"] }

@@ -38,6 +38,29 @@ struct MarketState {
     book: OrderBook,
     batch: BatchAuction,
     pending: VecDeque<IncomingOrder>,
+    open_orders_by_subaccount: HashMap<u64, u64>,
+}
+
+impl MarketState {
+    fn open_orders_for_subaccount(&self, subaccount_id: u64) -> u64 {
+        self.open_orders_by_subaccount
+            .get(&subaccount_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn track_open_order_add(&mut self, subaccount_id: u64) {
+        *self.open_orders_by_subaccount.entry(subaccount_id).or_insert(0) += 1;
+    }
+
+    fn track_open_order_remove(&mut self, subaccount_id: u64) {
+        if let Some(count) = self.open_orders_by_subaccount.get_mut(&subaccount_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.open_orders_by_subaccount.remove(&subaccount_id);
+            }
+        }
+    }
 }
 
 pub struct EngineShard {
@@ -63,6 +86,7 @@ impl EngineShard {
                     book: OrderBook::new(),
                     batch: BatchAuction::default(),
                     pending: VecDeque::new(),
+                    open_orders_by_subaccount: HashMap::new(),
                 },
             );
         }
@@ -125,11 +149,33 @@ impl EngineShard {
                         ingress_seq: order.ingress_seq,
                     };
                     market_state.book.place_order(incoming, 0);
+                    market_state.track_open_order_add(order.subaccount_id);
                     shard.order_owners.insert(order.order_id, (order.subaccount_id, order.side));
                 }
             }
         }
         shard
+    }
+
+    pub fn upsert_market(&mut self, market: MarketConfig) {
+        self.risk.update_mark(market.market_id, market.tick_size);
+        match self.markets.get_mut(&market.market_id) {
+            Some(existing) => {
+                existing.config = market;
+            }
+            None => {
+                self.markets.insert(
+                    market.market_id,
+                    MarketState {
+                        config: market,
+                        book: OrderBook::new(),
+                        batch: BatchAuction::default(),
+                        pending: VecDeque::new(),
+                        open_orders_by_subaccount: HashMap::new(),
+                    },
+                );
+            }
+        }
     }
 
     #[instrument(skip(self))]
@@ -203,7 +249,7 @@ impl EngineShard {
             ts,
         });
 
-        let (matching_mode, market_config, fills, snapshot, closed_ids) = {
+        let (matching_mode, market_config, fills, snapshot, closed_maker_ids, taker_rested) = {
             let market = self
                 .markets
                 .get_mut(&order.market_id)
@@ -212,22 +258,20 @@ impl EngineShard {
             let config = market.config.clone();
             match mode {
                 MatchingMode::Continuous => {
-                    let (fills, _) = market.book.place_order(incoming, 1024);
+                    let (fills, resting_id) = market.book.place_order(incoming, 1024);
                     let snapshot = market.book.snapshot(10);
-                    let mut closed_ids = Vec::new();
+                    let mut closed_maker_ids = Vec::new();
                     for fill in &fills {
                         if !market.book.has_order(fill.maker_order_id) {
-                            closed_ids.push(fill.maker_order_id);
-                        }
-                        if !market.book.has_order(fill.taker_order_id) {
-                            closed_ids.push(fill.taker_order_id);
+                            closed_maker_ids.push(fill.maker_order_id);
                         }
                     }
-                    (mode, config, fills, Some(snapshot), closed_ids)
+                    let taker_rested = resting_id.is_some();
+                    (mode, config, fills, Some(snapshot), closed_maker_ids, taker_rested)
                 }
                 MatchingMode::Batch => {
                     market.batch.push(incoming);
-                    (mode, config, Vec::new(), None, Vec::new())
+                    (mode, config, Vec::new(), None, Vec::new(), false)
                 }
             }
         };
@@ -235,8 +279,19 @@ impl EngineShard {
         match matching_mode {
             MatchingMode::Continuous => {
                 events.extend(self.emit_fills(fills, &market_config, ts));
-                for order_id in closed_ids {
+                if taker_rested {
+                    if let Some(market) = self.markets.get_mut(&order.market_id) {
+                        market.track_open_order_add(order.subaccount_id);
+                    }
+                } else {
                     self.order_owners.remove(&order_id);
+                }
+                for maker_order_id in closed_maker_ids {
+                    if let Some((subaccount_id, _)) = self.order_owners.remove(&maker_order_id) {
+                        if let Some(market) = self.markets.get_mut(&order.market_id) {
+                            market.track_open_order_remove(subaccount_id);
+                        }
+                    }
                 }
                 if let Some(snapshot) = snapshot {
                     events.push(self.book_delta_from_snapshot(order.market_id, snapshot, ts));
@@ -253,7 +308,9 @@ impl EngineShard {
         if let Some(order_id) = cancel.order_id {
             if let Some(market) = self.markets.get_mut(&cancel.market_id) {
                 if market.book.cancel(order_id) {
-                    self.order_owners.remove(&order_id);
+                    if let Some((subaccount_id, _)) = self.order_owners.remove(&order_id) {
+                        market.track_open_order_remove(subaccount_id);
+                    }
                     snapshot = Some(market.book.snapshot(10));
                 }
             }
@@ -267,6 +324,16 @@ impl EngineShard {
     fn validate_order(&self, order: &NewOrder, market: &MarketState) -> Result<(), &'static str> {
         if order.order_type == crate::models::OrderType::PostOnly && market.book.would_cross(order.side, order.price_ticks) {
             return Err("post-only would cross");
+        }
+        let rest_can_increase_open_orders = order.tif == TimeInForce::Gtc
+            && order.order_type != crate::models::OrderType::Market;
+        if rest_can_increase_open_orders {
+            if market.config.max_open_orders_per_subaccount > 0
+                && market.open_orders_for_subaccount(order.subaccount_id)
+                    >= market.config.max_open_orders_per_subaccount
+            {
+                return Err("max open orders per subaccount");
+            }
         }
         self.risk
             .validate_order(

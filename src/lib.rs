@@ -7,5 +7,6 @@ pub mod persistence;
 pub mod risk;
 
 pub mod metrics;
+pub mod market_registry;
 
 pub use models::{Event, EventEnvelope, MarketId, OrderId, PriceTicks, Quantity, ShardId, SubaccountId};

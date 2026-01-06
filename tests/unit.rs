@@ -95,6 +95,7 @@ fn reduce_only_validation() {
         maintenance_margin_bps: 1,
         max_position: 10,
         price_band_bps: 10_000,
+        max_open_orders_per_subaccount: 0,
         matching_mode: MatchingMode::Continuous,
         batch_interval_ms: 2000,
     };

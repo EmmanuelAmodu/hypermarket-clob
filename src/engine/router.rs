@@ -9,6 +9,7 @@ use tracing::{info, warn};
 use crate::bus::Bus;
 use crate::config::Settings;
 use crate::engine::shard::EngineShard;
+use crate::market_registry;
 use crate::models::{pb, Event};
 use crate::persistence::wal::Wal;
 use crate::risk::{RiskConfig, RiskEngine};
@@ -17,12 +18,28 @@ pub async fn run_router(settings: Settings, bus: Arc<dyn Bus>) -> anyhow::Result
     let mut shard_senders = Vec::new();
     let mut shard_tasks = Vec::new();
 
+    let mut markets = settings.markets.clone();
+    if let Ok(dynamic) = market_registry::load_all(&settings.bus.nats_url, &settings.bus.markets_bucket).await {
+        let mut by_id = std::collections::HashMap::<u64, crate::config::MarketConfig>::new();
+        for m in markets.drain(..) {
+            by_id.insert(m.market_id, m);
+        }
+        for m in dynamic {
+            by_id.insert(m.market_id, m);
+        }
+        markets = by_id.into_values().collect();
+    }
+
+    enum ShardMsg {
+        Event { event: Event, ts: u64, message: crate::bus::BusMessage },
+        MarketUpdate(crate::config::MarketConfig),
+    }
+
     for shard_id in 0..settings.shard_count {
-        let (tx, mut rx) = mpsc::channel(1024);
+        let (tx, mut rx) = mpsc::channel::<ShardMsg>(1024);
         shard_senders.push(tx);
 
-        let shard_markets: Vec<_> = settings
-            .markets
+        let shard_markets: Vec<_> = markets
             .iter()
             .filter(|m| (m.market_id as usize) % settings.shard_count == shard_id)
             .cloned()
@@ -36,16 +53,47 @@ pub async fn run_router(settings: Settings, bus: Arc<dyn Bus>) -> anyhow::Result
         let output_subject = settings.bus.output_subject.clone();
         let bus_clone = Arc::clone(&bus);
         let handle = tokio::spawn(async move {
-            while let Some((event, ts)) = rx.recv().await {
-                if let Ok(outputs) = shard.handle_event(event, ts) {
-                    for output in outputs {
-                        let bytes = encode_output(output);
-                        let _ = bus_clone.publish(&output_subject, bytes).await;
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    ShardMsg::Event { event, ts, message } => match shard.handle_event(event, ts) {
+                        Ok(outputs) => {
+                            for output in outputs {
+                                let bytes = encode_output(output);
+                                let _ = bus_clone.publish(&output_subject, bytes).await;
+                            }
+                            let _ = bus_clone.ack(message).await;
+                        }
+                        Err(_) => {
+                            // Do not ack; allow redelivery.
+                        }
+                    },
+                    ShardMsg::MarketUpdate(market) => {
+                        shard.upsert_market(market);
                     }
                 }
             }
         });
         shard_tasks.push(handle);
+    }
+
+    // Watch for dynamic market updates and apply to the owning shard.
+    {
+        let (tx, mut rx) = mpsc::channel::<crate::config::MarketConfig>(1024);
+        tokio::spawn(market_registry::watch_updates_tx(
+            settings.bus.nats_url.clone(),
+            settings.bus.markets_bucket.clone(),
+            tx,
+        ));
+
+        let senders = shard_senders.clone();
+        tokio::spawn(async move {
+            while let Some(market) = rx.recv().await {
+                let shard_id = (market.market_id as usize) % senders.len();
+                if let Some(sender) = senders.get(shard_id) {
+                    let _ = sender.send(ShardMsg::MarketUpdate(market)).await;
+                }
+            }
+        });
     }
 
     let mut subscription = bus.subscribe(&settings.bus.input_subject).await?;
@@ -56,12 +104,25 @@ pub async fn run_router(settings: Settings, bus: Arc<dyn Bus>) -> anyhow::Result
             let market_id = market_id_for_event(&event).unwrap_or(0);
             let shard_id = (market_id as usize) % settings.shard_count;
             if let Some(sender) = shard_senders.get(shard_id) {
-                let _ = sender.send((event, ts)).await;
+                if sender
+                    .send(ShardMsg::Event {
+                        event,
+                        ts,
+                        message,
+                    })
+                    .await
+                    .is_err()
+                {
+                    warn!("failed to forward input event to shard");
+                }
+            } else {
+                warn!("no shard sender for input event");
+                let _ = bus.ack(message).await;
             }
         } else {
             warn!("failed to decode input event");
+            let _ = bus.ack(message).await;
         }
-        let _ = bus.ack(message).await;
     }
 
     info!("router stopped");
