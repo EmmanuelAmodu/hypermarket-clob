@@ -25,6 +25,12 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let settings = Settings::load(&args.config)?;
-    let bus = JetStreamBus::connect(&settings.bus.nats_url, settings.bus.durable_name.clone()).await?;
+    let bus = JetStreamBus::connect(
+        &settings.bus.nats_url,
+        settings.bus.stream_name.clone(),
+        vec![settings.bus.input_subject.clone(), settings.bus.output_subject.clone()],
+        settings.bus.durable_name.clone(),
+    )
+    .await?;
     run_router(settings, Arc::new(bus)).await
 }

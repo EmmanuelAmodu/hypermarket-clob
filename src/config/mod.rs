@@ -15,7 +15,13 @@ pub struct BusConfig {
     pub nats_url: String,
     pub input_subject: String,
     pub output_subject: String,
+    #[serde(default = "default_stream_name")]
+    pub stream_name: String,
     pub durable_name: String,
+}
+
+fn default_stream_name() -> String {
+    "CLOB".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -29,6 +35,8 @@ pub struct MarketConfig {
     pub maintenance_margin_bps: u64,
     pub max_position: i64,
     pub price_band_bps: u64,
+    #[serde(default)]
+    pub max_open_orders_per_subaccount: u64,
     pub matching_mode: MatchingMode,
     pub batch_interval_ms: u64,
 }

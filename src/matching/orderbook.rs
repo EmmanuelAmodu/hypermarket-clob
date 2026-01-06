@@ -220,6 +220,10 @@ impl OrderBook {
             return (fills, None);
         }
 
+        if incoming.order_type == OrderType::Market {
+            return (fills, None);
+        }
+
         match incoming.tif {
             TimeInForce::Ioc => (fills, None),
             TimeInForce::Fok => (fills, None),

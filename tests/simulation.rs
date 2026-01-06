@@ -17,6 +17,7 @@ fn market(mode: MatchingMode) -> MarketConfig {
         maintenance_margin_bps: 1,
         max_position: 1000,
         price_band_bps: 10_000,
+        max_open_orders_per_subaccount: 0,
         matching_mode: mode,
         batch_interval_ms: 2000,
     }

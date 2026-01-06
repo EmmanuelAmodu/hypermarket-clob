@@ -18,7 +18,7 @@ pub async fn run_router(settings: Settings, bus: Arc<dyn Bus>) -> anyhow::Result
     let mut shard_tasks = Vec::new();
 
     for shard_id in 0..settings.shard_count {
-        let (tx, mut rx) = mpsc::channel(1024);
+        let (tx, mut rx) = mpsc::channel::<(Event, u64, crate::bus::BusMessage)>(1024);
         shard_senders.push(tx);
 
         let shard_markets: Vec<_> = settings
@@ -36,13 +36,19 @@ pub async fn run_router(settings: Settings, bus: Arc<dyn Bus>) -> anyhow::Result
         let output_subject = settings.bus.output_subject.clone();
         let bus_clone = Arc::clone(&bus);
         let handle = tokio::spawn(async move {
-            while let Some((event, ts)) = rx.recv().await {
-                if let Ok(outputs) = shard.handle_event(event, ts) {
-                    for output in outputs {
-                        let bytes = encode_output(output);
-                        let _ = bus_clone.publish(&output_subject, bytes).await;
+            while let Some((event, ts, message)) = rx.recv().await {
+                match shard.handle_event(event, ts) {
+                    Ok(outputs) => {
+                        for output in outputs {
+                            let bytes = encode_output(output);
+                            let _ = bus_clone.publish(&output_subject, bytes).await;
+                        }
+                        let _ = bus_clone.ack(message).await;
                     }
-                }
+                    Err(_) => {
+                        // Do not ack; allow redelivery.
+                    }
+                };
             }
         });
         shard_tasks.push(handle);
@@ -56,12 +62,17 @@ pub async fn run_router(settings: Settings, bus: Arc<dyn Bus>) -> anyhow::Result
             let market_id = market_id_for_event(&event).unwrap_or(0);
             let shard_id = (market_id as usize) % settings.shard_count;
             if let Some(sender) = shard_senders.get(shard_id) {
-                let _ = sender.send((event, ts)).await;
+                if sender.send((event, ts, message)).await.is_err() {
+                    warn!("failed to forward input event to shard");
+                }
+            } else {
+                warn!("no shard sender for input event");
+                let _ = bus.ack(message).await;
             }
         } else {
             warn!("failed to decode input event");
+            let _ = bus.ack(message).await;
         }
-        let _ = bus.ack(message).await;
     }
 
     info!("router stopped");
