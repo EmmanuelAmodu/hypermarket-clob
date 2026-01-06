@@ -4,6 +4,7 @@ use serde::Deserialize;
 pub struct Settings {
     pub bus: BusConfig,
     pub shard_count: usize,
+    #[serde(default)]
     pub markets: Vec<MarketConfig>,
     pub persistence: PersistenceConfig,
     pub snapshot_interval_secs: u64,
@@ -18,10 +19,16 @@ pub struct BusConfig {
     #[serde(default = "default_stream_name")]
     pub stream_name: String,
     pub durable_name: String,
+    #[serde(default = "default_markets_bucket")]
+    pub markets_bucket: String,
 }
 
 fn default_stream_name() -> String {
     "CLOB".to_string()
+}
+
+fn default_markets_bucket() -> String {
+    "MARKETS".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]

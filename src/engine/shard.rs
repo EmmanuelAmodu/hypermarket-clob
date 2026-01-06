@@ -157,6 +157,27 @@ impl EngineShard {
         shard
     }
 
+    pub fn upsert_market(&mut self, market: MarketConfig) {
+        self.risk.update_mark(market.market_id, market.tick_size);
+        match self.markets.get_mut(&market.market_id) {
+            Some(existing) => {
+                existing.config = market;
+            }
+            None => {
+                self.markets.insert(
+                    market.market_id,
+                    MarketState {
+                        config: market,
+                        book: OrderBook::new(),
+                        batch: BatchAuction::default(),
+                        pending: VecDeque::new(),
+                        open_orders_by_subaccount: HashMap::new(),
+                    },
+                );
+            }
+        }
+    }
+
     #[instrument(skip(self))]
     pub fn handle_event(&mut self, event: Event, ts: u64) -> anyhow::Result<Vec<EventEnvelope>> {
         self.engine_seq += 1;

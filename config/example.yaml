@@ -4,9 +4,12 @@ bus:
   output_subject: "clob.outputs"
   stream_name: "CLOB"
   durable_name: "clob-engine"
+  markets_bucket: "MARKETS"
 
 shard_count: 2
 
+# Optional seed markets. Markets can also be created dynamically by writing JSON configs into the
+# NATS JetStream KV bucket `bus.markets_bucket` (key = market_id, value = MarketConfig JSON).
 markets:
   - market_id: 1
     tick_size: 1
